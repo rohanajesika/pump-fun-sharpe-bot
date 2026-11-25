@@ -8,11 +8,12 @@ A paper-trading bot for make.fun's "Pump.fun Sharpe Sprint — Cleanest Paper Bo
 
 ## Strategy
 
-"Spray-and-trail", written from scratch for this competition:
+"Dip-and-bounce", written from scratch for this competition:
 
-- **Enter** early and wide: any young curve with net buying over its last few trades, as soon as it holds enough real SOL reserve for a qualifying buy. No rise threshold to chase, no ranking by hottest rise — entries are taken in replay order, first trigger first.
+- **Enter** on a shallow dip in an established curve: price down 5% or more over its last 8 trading slots, buyers already returning in the latest slot (buy SOL >= 1.2x sell SOL), real reserve >= 10 SOL, at least 12 trades in the window. Buying while the price is falling means the harness's 2-slot fill latency lands lower, not higher — momentum entries buy the top of every spike instead.
 - **One small trade per mint** (0.10 SOL, at most 5 open at once), so a single bad coin can never sink an hour — and so the book spreads across the 20+ distinct mints the guardrails require.
-- **Exit** with no fixed take-profit: a -8% stop-loss cuts the many coins that die, a trailing stop (armed at +10%, out on a 5% pullback from the peak) lets the rare runners pay for all of them, and a ~40-minute age timeout frees slots stuck in flat coins.
+- **Exit** into strength with no fixed take-profit: a -8% stop-loss cuts the many coins that die, a tight trailing stop (armed at +8%, out on a 4% pullback from the peak) sells while the price is rising so the 2-slot exit lag fills higher, and a ~40-minute age timeout frees slots stuck in flat coins.
+- **Never chase**: a buy the market refuses (slippage — the coin ran away inside the 2-slot latency) ends that mint's story; re-basing the entry higher would buy the top of the same pump.
 - **Deterministic**: every decision is a pure function of the replay state (hello, batch, orders, slot). No clock, no randomness, no network, no environment — the two grading executions produce identical action logs.
 
 ## Run it

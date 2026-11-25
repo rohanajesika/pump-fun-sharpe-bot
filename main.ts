@@ -19,6 +19,10 @@
 //     many coins that die, a trailing stop (armed at +10%, out on a 5%
 //     pullback from the peak) lets the rare runners pay for all of them,
 //     and a ~40-minute age timeout frees slots stuck in flat coins.
+//   * Never chase: a buy the market refuses (the coin ran away inside the
+//     2-slot latency) ends that mint's story — re-basing the entry higher
+//     would buy the top of the same pump. Buys carry a tight 3% slippage
+//     cap for the same reason; sells carry a wide one so exits land.
 //   * Every decision is a pure function of the replay state (hello, batch,
 //     orders, slot): no clock, no randomness, no network, no environment.
 //     The two grading executions therefore produce identical action logs.

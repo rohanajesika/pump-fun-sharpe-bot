@@ -63,8 +63,11 @@ const TRAIL_ARM = 0.1;
 const TRAIL_PULLBACK = 0.05;
 /** Give up on a flat trade after this many slots (~40 minutes). */
 const MAX_HOLD_SLOTS = 6000;
-/** Slippage tolerance on every order, in basis points. */
-const SLIPPAGE_BPS = 500;
+/** Slippage tolerance on buys, in basis points: tight, so a coin that runs
+ *  away inside the 2-slot latency is skipped instead of bought at its top. */
+const BUY_SLIPPAGE_BPS = 300;
+/** Slippage tolerance on sells: wide, so an exit lands even in a dump. */
+const SELL_SLIPPAGE_BPS = 1000;
 
 // ---------------------------------------------------------------- tracking
 
@@ -223,8 +226,14 @@ await runBot({
 
     // 2. Fold this batch's fills into the open-trade records.
     for (const fill of batch.fills) {
-      if (fill.status !== "filled") continue;
       if (fill.side === "buy") {
+        if (fill.status !== "filled") {
+          // A buy the market refused (slippage: the coin ran away in the
+          // 2-slot latency) or a failed transaction is never chased: the
+          // re-based entry would buy the top of the same pump. Skip the mint.
+          done.add(fill.mint);
+          continue;
+        }
         const quote = Number(BigInt(fill.quote_lamports));
         const tokens = Number(BigInt(fill.token_amount));
         if (tokens > 0) {
@@ -236,6 +245,7 @@ await runBot({
           });
         }
       } else {
+        if (fill.status !== "filled") continue;
         // A sell (ours, or the harness closing a completed/flattened coin).
         entries.delete(fill.mint);
         done.add(fill.mint);
@@ -272,7 +282,7 @@ await runBot({
           side: "sell",
           mint,
           token_amount: holding.token_amount,
-          max_slippage_bps: SLIPPAGE_BPS,
+          max_slippage_bps: SELL_SLIPPAGE_BPS,
         });
       }
     }
@@ -305,7 +315,7 @@ await runBot({
           side: "buy",
           mint: event.mint,
           quote_lamports: size,
-          max_slippage_bps: SLIPPAGE_BPS,
+          max_slippage_bps: BUY_SLIPPAGE_BPS,
         });
         committedLamports += size + fee;
         buys += 1;

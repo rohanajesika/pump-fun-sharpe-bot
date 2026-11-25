@@ -1,24 +1,31 @@
-// Pump.fun Sharpe Sprint — "spray-and-trail" paper bot.
+// Pump.fun Sharpe Sprint — "dip-and-bounce" paper bot (v4).
 //
 // The brief ranks by hourly Sharpe ratio on a 6-hour pump.fun forward
 // replay, not by wildest PnL, and a place needs net PnL above holding cash
 // plus at least 20 distinct mints round-tripped at 0.01 SOL or more, with
-// max drawdown 50%. The dev data says what works here, and it is not
-// scalping for a fixed take-profit: a fixed +12% target caps exactly the
-// coins that pay (the few that run several hundred percent), while the
-// 2-slot fill latency buys the top of every spike. What the data rewards is
-// the opposite shape:
+// max drawdown 50%. Three generations of this bot lost money on the dev
+// window (v1 -0.33 SOL, v2 -0.70 SOL, v3 -0.63 SOL), and the offline
+// analysis finally said why: the harness fills every order 2 slots after
+// the decision, at end-of-slot prices. A momentum bot therefore buys the
+// top of every spike and sells the bottom of every dump — both lags work
+// against it — and no momentum or long-hold rule survives that at slot
+// granularity (all variants -3% to -20% expected value per trade). The
+// shape the lags actually reward is the opposite one:
 //
-//   * ENTER early and wide: any young curve with net buying over its last
-//     few trades, as soon as it holds enough real SOL reserve for a
-//     qualifying buy. No rise threshold to chase, no ranking by hottest
-//     rise — entries are taken in replay order, first trigger first.
-//   * One small fixed-size trade per mint, at most five open at once, so a
-//     single bad coin can never sink an hour.
-//   * EXIT with no fixed take-profit at all: a -8% stop-loss cuts the
-//     many coins that die, a trailing stop (armed at +10%, out on a 5%
-//     pullback from the peak) lets the rare runners pay for all of them,
-//     and a ~40-minute age timeout frees slots stuck in flat coins.
+//   * ENTER on a shallow dip in an established curve: price down 5% or
+//     more over its last 8 trading slots, buyers already returning in the
+//     latest slot (buy SOL >= 1.2x sell SOL), real reserve >= 10 SOL, at
+//     least 12 trades in the window. Buying while the price is falling
+//     means the 2-slot entry lag fills LOWER, not higher.
+//   * EXIT into strength: a tight trailing stop (armed at +8%, out on a
+//     4% pullback from the peak) sells while the price is rising, so the
+//     2-slot exit lag fills HIGHER. A -8% stop-loss and a ~40-minute
+//     timeout bound the losers.
+//   * One small fixed-size trade per mint (0.10 SOL, the harness's 1%
+//     cap is not binding at >= 10 SOL real reserve), at most five open at
+//     once, so a single bad coin can never sink an hour. The pocket
+//     averages ~7 first triggers an hour on the dev window, ~40 per
+//     6-hour window — comfortably above the 20-mint bar.
 //   * Never chase: a buy the market refuses (the coin ran away inside the
 //     2-slot latency) ends that mint's story — re-basing the entry higher
 //     would buy the top of the same pump. Buys carry a tight 3% slippage
@@ -42,29 +49,27 @@ const BUY_LAMPORTS = 100_000_000n; // 0.10 SOL
 /** A buy must still be at least this big to count toward the 20-mint bar. */
 const MIN_BUY_LAMPORTS = 12_000_000n; // 0.012 SOL, a margin over 0.01
 /** Real SOL reserve a curve needs before we touch it (cap >= MIN_BUY). */
-const MIN_REAL_RESERVE_LAMPORTS = 1_200_000_000n; // 1.2 SOL
-/** Trades we must have seen on a curve before judging its buying. */
-const MIN_TRADES = 4;
-/** Trades kept per curve for the buying-pressure window. */
-const WINDOW = 4;
-/** No rise threshold: entries are early, before any spike to chase. */
-const IGNITION_RISE = 0.0;
-/** Buy SOL volume must beat sell SOL volume by at least this factor. */
-const BUY_PRESSURE = 1.2;
-/** Never chase a coin that already ran this far above its birth price. */
-const MAX_RUN_FROM_BIRTH = 1.3; // +30%
+const MIN_REAL_RESERVE_LAMPORTS = 10_000_000_000n; // 10 SOL
+/** Trading slots kept per curve for the dip window. */
+const WINDOW_BARS = 8;
+/** Trades we must have seen across the window before judging a dip. */
+const MIN_TRADES = 12;
+/** Enter only if the price fell at least this far over the window. */
+const DIP = -0.05; // -5%
+/** The latest slot's buy SOL must beat its sell SOL by this factor. */
+const LAST_BAR_BUY_X = 1.2;
 /** Only coins this young (slots since CreateEvent) are eligible. */
 const MAX_COIN_AGE_SLOTS = 7200;
 /** A trade counts as recent only if its last trade is this fresh. */
 const MAX_STALE_SLOTS = 60;
 /** New buys per batch at most (keeps entries from bunching in one slot). */
-const MAX_NEW_BUYS_PER_BATCH = 2;
-/** No fixed take-profit: the trailing stop banks the runners instead. */
+const MAX_NEW_BUYS_PER_BATCH = 5;
+/** No fixed take-profit: the trailing stop banks the bounce instead. */
 /** Stop-loss: sell when the price is this far below the entry price. */
 const STOP_LOSS = 0.08; // -8%
-/** Once a trade is +10% up, a 5% pullback from its peak locks the gain. */
-const TRAIL_ARM = 0.1;
-const TRAIL_PULLBACK = 0.05;
+/** Once a trade is +8% up, a 4% pullback from its peak locks the gain. */
+const TRAIL_ARM = 0.08;
+const TRAIL_PULLBACK = 0.04;
 /** Give up on a flat trade after this many slots (~40 minutes). */
 const MAX_HOLD_SLOTS = 6000;
 /** Slippage tolerance on buys, in basis points: tight, so a coin that runs
@@ -75,16 +80,21 @@ const SELL_SLIPPAGE_BPS = 1000;
 
 // ---------------------------------------------------------------- tracking
 
+/** One trading slot's worth of a curve: end price and both sides' volume. */
+interface Bar {
+  slot: number;
+  endPrice: number;
+  endReal: number;
+  buySol: number;
+  sellSol: number;
+  trades: number;
+}
+
 /** What we remember about one curve, from its own trades only. */
 interface Coin {
   createdSlot: number;
-  /** Price (SOL per token) at the curve's first observed trade. */
-  firstPrice: number;
-  /** Last WINDOW post-trade prices, oldest first. */
-  prices: number[];
-  /** SOL volume of the last WINDOW trades, split by side. */
-  buySol: number[];
-  sellSol: number[];
+  /** Last WINDOW_BARS trading slots, oldest first. */
+  bars: Bar[];
   trades: number;
   lastSlot: number;
   complete: boolean;
@@ -116,43 +126,47 @@ function noteTrade(
   price: number,
   isBuy: boolean,
   solLamports: bigint,
+  realLamports: bigint,
 ): void {
   let coin = coins.get(mint);
   if (coin === undefined) {
     coin = {
       createdSlot: slot,
-      firstPrice: price,
-      prices: [],
-      buySol: [],
-      sellSol: [],
+      bars: [],
       trades: 0,
       lastSlot: slot,
       complete: false,
     };
     coins.set(mint, coin);
   }
-  coin.prices.push(price);
-  if (coin.prices.length > WINDOW) coin.prices.shift();
   const sol = Number(solLamports) / 1e9;
-  coin.buySol.push(isBuy ? sol : 0);
-  coin.sellSol.push(isBuy ? 0 : sol);
-  if (coin.buySol.length > WINDOW) coin.buySol.shift();
-  if (coin.sellSol.length > WINDOW) coin.sellSol.shift();
+  const last = coin.bars[coin.bars.length - 1];
+  if (last !== undefined && last.slot === slot) {
+    last.endPrice = price;
+    last.endReal = Number(realLamports) / 1e9;
+    if (isBuy) last.buySol += sol;
+    else last.sellSol += sol;
+    last.trades += 1;
+  } else {
+    coin.bars.push({
+      slot,
+      endPrice: price,
+      endReal: Number(realLamports) / 1e9,
+      buySol: isBuy ? sol : 0,
+      sellSol: isBuy ? 0 : sol,
+      trades: 1,
+    });
+    if (coin.bars.length > WINDOW_BARS) coin.bars.shift();
+  }
   coin.trades += 1;
   coin.lastSlot = slot;
-}
-
-function sum(values: number[]): number {
-  let total = 0;
-  for (const v of values) total += v;
-  return total;
 }
 
 /** Whether a curve is eligible for a first trade, in replay order. */
 function eligible(mint: string, coin: Coin, state: BotState): boolean {
   if (coin.complete) return false;
   if (coin.trades < MIN_TRADES) return false;
-  if (coin.prices.length < WINDOW) return false;
+  if (coin.bars.length < WINDOW_BARS) return false;
   if (state.slot - coin.createdSlot > MAX_COIN_AGE_SLOTS) return false;
   if (state.slot - coin.lastSlot > MAX_STALE_SLOTS) return false;
   if (entries.has(mint) || done.has(mint)) return false;
@@ -164,20 +178,16 @@ function eligible(mint: string, coin: Coin, state: BotState): boolean {
   if (curve === undefined) return false;
   if (curve.real_quote_reserves < MIN_REAL_RESERVE_LAMPORTS) return false;
 
-  const first = coin.prices[0];
-  const last = coin.prices[coin.prices.length - 1];
-  if (first <= 0 || last <= 0) return false;
-  const rise = last / first - 1;
-  if (rise < IGNITION_RISE) return false;
-  // Do not chase a coin that already ran far from where it was born.
-  if (last / coin.firstPrice > MAX_RUN_FROM_BIRTH) return false;
-  const buys = sum(coin.buySol);
-  const sells = sum(coin.sellSol);
-  if (sells <= 0) {
-    if (buys <= 0) return false;
-  } else if (buys < BUY_PRESSURE * sells) {
-    return false;
-  }
+  // The dip: end price of the latest slot vs end price of the oldest slot
+  // in the window. A shallow dip (-5% or more) in an established curve,
+  // with buyers already returning in the latest slot.
+  const first = coin.bars[0];
+  const last = coin.bars[coin.bars.length - 1];
+  if (first.endPrice <= 0 || last.endPrice <= 0) return false;
+  const change = last.endPrice / first.endPrice - 1;
+  if (change > DIP) return false;
+  if (last.endReal < Number(MIN_REAL_RESERVE_LAMPORTS) / 1e9) return false;
+  if (last.sellSol > 0 && last.buySol < LAST_BAR_BUY_X * last.sellSol) return false;
   return true;
 }
 
@@ -193,21 +203,14 @@ await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
     const orders: OrderInput[] = [];
 
-    // 1. Fold this batch's events into the per-coin tracks.
+    // 1. Fold this batch's events into the per-coin slot bars.
     for (const event of batch.events) {
       if (event.event === "CreateEvent") {
-        const price = priceOf(
-          BigInt(event.virtual_quote_reserves),
-          BigInt(event.virtual_token_reserves),
-        );
         let coin = coins.get(event.mint);
         if (coin === undefined) {
           coin = {
             createdSlot: event.slot,
-            firstPrice: price,
-            prices: [],
-            buySol: [],
-            sellSol: [],
+            bars: [],
             trades: 0,
             lastSlot: event.slot,
             complete: false,
@@ -221,7 +224,14 @@ await runBot({
           BigInt(event.virtual_quote_reserves),
           BigInt(event.virtual_token_reserves),
         );
-        noteTrade(event.mint, event.slot, price, event.is_buy, BigInt(event.sol_amount));
+        noteTrade(
+          event.mint,
+          event.slot,
+          price,
+          event.is_buy,
+          BigInt(event.sol_amount),
+          BigInt(event.real_quote_reserves),
+        );
       } else {
         const coin = coins.get(event.mint);
         if (coin !== undefined) coin.complete = true;
@@ -278,7 +288,7 @@ await runBot({
       const agedOut = state.slot - entry.entrySlot >= MAX_HOLD_SLOTS;
       const stopLoss = change <= -STOP_LOSS;
       // No fixed take-profit: the trailing stop is the only way a winner
-      // leaves, so a runner keeps paying until it actually turns.
+      // leaves, so a bounce keeps paying until it actually turns.
       const trailing =
         peakGain >= TRAIL_ARM && pullback <= -TRAIL_PULLBACK;
       if (stopLoss || trailing || agedOut) {

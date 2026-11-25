@@ -8,11 +8,11 @@ A paper-trading bot for make.fun's "Pump.fun Sharpe Sprint — Cleanest Paper Bo
 
 ## Strategy
 
-"Ignition scalp", written from scratch for this competition:
+"Spray-and-trail", written from scratch for this competition:
 
-- **Enter** only on a fresh ignition: a young curve whose price just climbed at least 4% over its last 8 trades on a burst of net buying (buy SOL volume at least 2x sell SOL volume), while still near its birth price and with enough real SOL reserve for a qualifying buy.
+- **Enter** early and wide: any young curve with net buying over its last few trades, as soon as it holds enough real SOL reserve for a qualifying buy. No rise threshold to chase, no ranking by hottest rise — entries are taken in replay order, first trigger first.
 - **One small trade per mint** (0.10 SOL, at most 5 open at once), so a single bad coin can never sink an hour — and so the book spreads across the 20+ distinct mints the guardrails require.
-- **Exit** on a +12% take-profit, a -6% stop-loss, a trailing stop once a trade is +6% up, or a ~10-minute age timeout, whichever comes first. Positions never linger.
+- **Exit** with no fixed take-profit: a -8% stop-loss cuts the many coins that die, a trailing stop (armed at +10%, out on a 5% pullback from the peak) lets the rare runners pay for all of them, and a ~40-minute age timeout frees slots stuck in flat coins.
 - **Deterministic**: every decision is a pure function of the replay state (hello, batch, orders, slot). No clock, no randomness, no network, no environment — the two grading executions produce identical action logs.
 
 ## Run it

@@ -1,29 +1,33 @@
-// Pump.fun Sharpe Sprint — "ignition scalp" paper bot.
+// Pump.fun Sharpe Sprint — "spray-and-trail" paper bot.
 //
 // The brief ranks by hourly Sharpe ratio on a 6-hour pump.fun forward
 // replay, not by wildest PnL, and a place needs net PnL above holding cash
 // plus at least 20 distinct mints round-tripped at 0.01 SOL or more, with
-// max drawdown 50%. So this bot trades for steady, repeatable, small wins:
+// max drawdown 50%. The dev data says what works here, and it is not
+// scalping for a fixed take-profit: a fixed +12% target caps exactly the
+// coins that pay (the few that run several hundred percent), while the
+// 2-slot fill latency buys the top of every spike. What the data rewards is
+// the opposite shape:
 //
-//   * ENTER only on a fresh ignition: a young curve whose price has just
-//     climbed on a burst of net buying (buy SOL volume dominating sell SOL
-//     volume over its last few trades). No chasing of coins that already
-//     ran far from their birth price.
+//   * ENTER early and wide: any young curve with net buying over its last
+//     few trades, as soon as it holds enough real SOL reserve for a
+//     qualifying buy. No rise threshold to chase, no ranking by hottest
+//     rise — entries are taken in replay order, first trigger first.
 //   * One small fixed-size trade per mint, at most five open at once, so a
 //     single bad coin can never sink an hour.
-//   * EXIT on a fixed take-profit, a tighter stop-loss, a trailing stop
-//     once a trade is clearly green, or an age timeout — whichever comes
-//     first. Positions never linger.
+//   * EXIT with no fixed take-profit at all: a -8% stop-loss cuts the
+//     many coins that die, a trailing stop (armed at +10%, out on a 5%
+//     pullback from the peak) lets the rare runners pay for all of them,
+//     and a ~40-minute age timeout frees slots stuck in flat coins.
 //   * Every decision is a pure function of the replay state (hello, batch,
 //     orders, slot): no clock, no randomness, no network, no environment.
 //     The two grading executions therefore produce identical action logs.
 //
 // Wire protocol: the harness speaks agent-fun/replay/v2 on stdin/stdout.
 // The vendored shim (vendor/makefun-bot.ts, the kit's own SDK) owns the
-// wire; this file only decides orders. A buy's size is capped at 1% of the
-// mint's real SOL reserve per reply by the harness, and each order pays
-// base + priority tx fees plus ~1.25% curve fees, so the take-profit is set
-// wide enough to clear a full round trip's fees with room to spare.
+// wire; this file only decides orders. Each order pays base + priority tx
+// fees plus ~1.25% curve fees, so exits are sized to clear a full round
+// trip's fees with room to spare.
 
 import { runBot, type Batch, type BotState, type OrderInput } from "./vendor/makefun-bot.ts";
 
@@ -35,14 +39,14 @@ const BUY_LAMPORTS = 100_000_000n; // 0.10 SOL
 const MIN_BUY_LAMPORTS = 12_000_000n; // 0.012 SOL, a margin over 0.01
 /** Real SOL reserve a curve needs before we touch it (cap >= MIN_BUY). */
 const MIN_REAL_RESERVE_LAMPORTS = 1_200_000_000n; // 1.2 SOL
-/** Trades we must have seen on a curve before judging its ignition. */
-const MIN_TRADES = 8;
-/** Trades kept per curve for the momentum / pressure window. */
-const WINDOW = 8;
-/** Price rise over the window that counts as ignition. */
-const IGNITION_RISE = 0.04; // +4%
+/** Trades we must have seen on a curve before judging its buying. */
+const MIN_TRADES = 4;
+/** Trades kept per curve for the buying-pressure window. */
+const WINDOW = 4;
+/** No rise threshold: entries are early, before any spike to chase. */
+const IGNITION_RISE = 0.0;
 /** Buy SOL volume must beat sell SOL volume by at least this factor. */
-const BUY_PRESSURE = 2.0;
+const BUY_PRESSURE = 1.2;
 /** Never chase a coin that already ran this far above its birth price. */
 const MAX_RUN_FROM_BIRTH = 1.3; // +30%
 /** Only coins this young (slots since CreateEvent) are eligible. */
@@ -51,15 +55,14 @@ const MAX_COIN_AGE_SLOTS = 7200;
 const MAX_STALE_SLOTS = 60;
 /** New buys per batch at most (keeps entries from bunching in one slot). */
 const MAX_NEW_BUYS_PER_BATCH = 2;
-/** Take-profit: sell when the price is this far above the entry price. */
-const TAKE_PROFIT = 0.12; // +12%
+/** No fixed take-profit: the trailing stop banks the runners instead. */
 /** Stop-loss: sell when the price is this far below the entry price. */
-const STOP_LOSS = 0.06; // -6%
-/** Once a trade is +6% up, a 3.5% pullback from its peak locks the gain. */
-const TRAIL_ARM = 0.06;
-const TRAIL_PULLBACK = 0.035;
-/** Give up on a flat trade after this many slots (~10 minutes). */
-const MAX_HOLD_SLOTS = 1500;
+const STOP_LOSS = 0.08; // -8%
+/** Once a trade is +10% up, a 5% pullback from its peak locks the gain. */
+const TRAIL_ARM = 0.1;
+const TRAIL_PULLBACK = 0.05;
+/** Give up on a flat trade after this many slots (~40 minutes). */
+const MAX_HOLD_SLOTS = 6000;
 /** Slippage tolerance on every order, in basis points. */
 const SLIPPAGE_BPS = 500;
 
@@ -138,38 +141,37 @@ function sum(values: number[]): number {
   return total;
 }
 
-/** Net-buying ignition score of a curve, or null when it is not eligible. */
-function ignition(mint: string, coin: Coin, state: BotState): number | null {
-  if (coin.complete) return null;
-  if (coin.trades < MIN_TRADES) return null;
-  if (coin.prices.length < WINDOW) return null;
-  if (state.slot - coin.createdSlot > MAX_COIN_AGE_SLOTS) return null;
-  if (state.slot - coin.lastSlot > MAX_STALE_SLOTS) return null;
-  if (entries.has(mint) || done.has(mint)) return null;
-  if (state.positions.has(mint)) return null;
+/** Whether a curve is eligible for a first trade, in replay order. */
+function eligible(mint: string, coin: Coin, state: BotState): boolean {
+  if (coin.complete) return false;
+  if (coin.trades < MIN_TRADES) return false;
+  if (coin.prices.length < WINDOW) return false;
+  if (state.slot - coin.createdSlot > MAX_COIN_AGE_SLOTS) return false;
+  if (state.slot - coin.lastSlot > MAX_STALE_SLOTS) return false;
+  if (entries.has(mint) || done.has(mint)) return false;
+  if (state.positions.has(mint)) return false;
   for (const pending of state.pending.values()) {
-    if (pending.order.side === "buy" && pending.order.mint === mint) return null;
+    if (pending.order.side === "buy" && pending.order.mint === mint) return false;
   }
   const curve = state.curves.get(mint);
-  if (curve === undefined) return null;
-  if (curve.real_quote_reserves < MIN_REAL_RESERVE_LAMPORTS) return null;
+  if (curve === undefined) return false;
+  if (curve.real_quote_reserves < MIN_REAL_RESERVE_LAMPORTS) return false;
 
   const first = coin.prices[0];
   const last = coin.prices[coin.prices.length - 1];
-  if (first <= 0 || last <= 0) return null;
+  if (first <= 0 || last <= 0) return false;
   const rise = last / first - 1;
-  if (rise < IGNITION_RISE) return null;
+  if (rise < IGNITION_RISE) return false;
   // Do not chase a coin that already ran far from where it was born.
-  if (last / coin.firstPrice > MAX_RUN_FROM_BIRTH) return null;
+  if (last / coin.firstPrice > MAX_RUN_FROM_BIRTH) return false;
   const buys = sum(coin.buySol);
   const sells = sum(coin.sellSol);
   if (sells <= 0) {
-    if (buys <= 0) return null;
+    if (buys <= 0) return false;
   } else if (buys < BUY_PRESSURE * sells) {
-    return null;
+    return false;
   }
-  // Strongest ignition first; ties break on mint so ordering is stable.
-  return rise;
+  return true;
 }
 
 function currentPrice(state: BotState, mint: string): number {
@@ -260,11 +262,12 @@ await runBot({
       const peakGain = entry.peakPrice / entry.entryPrice - 1;
       const pullback = price / entry.peakPrice - 1;
       const agedOut = state.slot - entry.entrySlot >= MAX_HOLD_SLOTS;
-      const takeProfit = change >= TAKE_PROFIT;
       const stopLoss = change <= -STOP_LOSS;
+      // No fixed take-profit: the trailing stop is the only way a winner
+      // leaves, so a runner keeps paying until it actually turns.
       const trailing =
         peakGain >= TRAIL_ARM && pullback <= -TRAIL_PULLBACK;
-      if (takeProfit || stopLoss || trailing || agedOut) {
+      if (stopLoss || trailing || agedOut) {
         orders.push({
           side: "sell",
           mint,
@@ -274,37 +277,33 @@ await runBot({
       }
     }
 
-    // 4. Entries: the strongest fresh ignitions in this batch, up to the cap.
+    // 4. Entries: eligible coins in this batch's own order, up to the cap.
+    // No ranking by hottest rise: the hottest coins are nearest their top.
     const open = state.committedPositionCount();
     const room = state.hello.caps.max_open_positions - open;
     if (room > 0) {
-      const candidates: { mint: string; score: number }[] = [];
+      let buys = 0;
+      // Cash the orders already pushed this batch will take: the shim only
+      // records them as pending after onBatch returns, so track it here.
+      let committedLamports = 0n;
       const seen = new Set<string>();
       for (const event of batch.events) {
+        if (buys >= MAX_NEW_BUYS_PER_BATCH) break;
+        if (buys >= room) break;
         if (event.event !== "TradeEvent") continue;
         if (seen.has(event.mint)) continue;
         seen.add(event.mint);
         const coin = coins.get(event.mint);
         if (coin === undefined) continue;
-        const score = ignition(event.mint, coin, state);
-        if (score !== null) candidates.push({ mint: event.mint, score });
-      }
-      candidates.sort((a, b) => b.score - a.score || (a.mint < b.mint ? -1 : 1));
-      let buys = 0;
-      // Cash the orders already pushed this batch will take: the shim only
-      // records them as pending after onBatch returns, so track it here.
-      let committedLamports = 0n;
-      for (const candidate of candidates) {
-        if (buys >= MAX_NEW_BUYS_PER_BATCH) break;
-        if (buys >= room) break;
-        const cap = state.maxBuyLamports(candidate.mint);
+        if (!eligible(event.mint, coin, state)) continue;
+        const cap = state.maxBuyLamports(event.mint);
         const size = cap < BUY_LAMPORTS ? cap : BUY_LAMPORTS;
         if (size < MIN_BUY_LAMPORTS) continue;
         const fee = state.txFeeLamports();
         if (state.freeCashLamports() - committedLamports < size + fee) continue;
         orders.push({
           side: "buy",
-          mint: candidate.mint,
+          mint: event.mint,
           quote_lamports: size,
           max_slippage_bps: SLIPPAGE_BPS,
         });
